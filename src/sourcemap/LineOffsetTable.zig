@@ -76,90 +76,121 @@ pub const Compact = struct {
             return null;
         }
 
-        const line_start = self.line_offsets[@intCast(target_line)];
-        const line_end = if (target_line + 1 < self.line_offsets.len)
-            self.line_offsets[@intCast(target_line + 1)] - 1 // -1 to exclude the ';'
-        else
-            @as(u32, @intCast(self.vlq_mappings.len));
+        // VLQ values are accumulated globally across ALL lines, not reset per line
+        // We need to decode from the beginning up to the target line to get correct accumulated state
+        var global_source_index: i32 = 0;
+        var global_original_line: i32 = 0;
+        var global_original_column: i32 = 0;
 
-        if (line_start >= line_end) return null;
-
-        const line_mappings = self.vlq_mappings[line_start..line_end];
-
-        // Decode VLQ mappings for this line
-        var generated_column: i32 = 0;
-        var source_index: i32 = 0;
-        var original_line: i32 = 0;
-        var original_column: i32 = 0;
-
-        var pos: usize = 0;
         var best_mapping: ?SourceMapping = null;
 
-        while (pos < line_mappings.len) {
-            // Skip commas
-            if (line_mappings[pos] == ',') {
-                pos += 1;
+        // Process all lines up to and including the target line
+        var current_line: i32 = 0;
+        while (current_line <= target_line and current_line < self.line_offsets.len - 1) {
+            const line_start = self.line_offsets[@intCast(current_line)];
+            const line_end = if (current_line + 1 < self.line_offsets.len)
+                self.line_offsets[@intCast(current_line + 1)] - 1 // -1 to exclude the ';'
+            else
+                @as(u32, @intCast(self.vlq_mappings.len));
+
+            if (line_start >= line_end) {
+                current_line += 1;
                 continue;
             }
 
-            // Decode generated column delta
-            const gen_col_result = VLQ.decode(line_mappings, pos);
-            if (gen_col_result.start == pos) break; // Invalid VLQ
-            generated_column += gen_col_result.value;
-            pos = gen_col_result.start;
+            const line_mappings = self.vlq_mappings[line_start..line_end];
 
-            // If we've passed the target column, return the last good mapping
-            if (generated_column > target_column and best_mapping != null) {
-                return best_mapping;
-            }
+            // For each line, generated_column resets to 0 but other accumulators persist
+            var line_generated_column: i32 = 0;
+            var pos: usize = 0;
 
-            if (pos >= line_mappings.len) break;
-            if (line_mappings[pos] == ',') {
-                // Only generated column - no source info
-                pos += 1;
-                continue;
-            }
+            while (pos < line_mappings.len) {
+                // Skip commas
+                if (line_mappings[pos] == ',') {
+                    pos += 1;
+                    continue;
+                }
 
-            // Decode source index delta
-            const src_idx_result = VLQ.decode(line_mappings, pos);
-            if (src_idx_result.start == pos) break;
-            source_index += src_idx_result.value;
-            pos = src_idx_result.start;
+                // Decode generated column delta (resets per line)
+                const gen_col_result = VLQ.decode(line_mappings, pos);
+                if (gen_col_result.start == pos) break; // Invalid VLQ
+                line_generated_column += gen_col_result.value;
+                pos = gen_col_result.start;
 
-            if (pos >= line_mappings.len) break;
+                // Only process mappings for the target line
+                if (current_line == target_line) {
+                    // If we've passed the target column, return the last good mapping
+                    if (line_generated_column > target_column and best_mapping != null) {
+                        return best_mapping;
+                    }
+                }
 
-            // Decode original line delta
-            const orig_line_result = VLQ.decode(line_mappings, pos);
-            if (orig_line_result.start == pos) break;
-            original_line += orig_line_result.value;
-            pos = orig_line_result.start;
+                if (pos >= line_mappings.len) break;
+                if (line_mappings[pos] == ',') {
+                    // Only generated column - no source info, but we might need to update best_mapping
+                    if (current_line == target_line and line_generated_column <= target_column) {
+                        // This is a mapping with no source info, so keep previous source info if we had it
+                        if (best_mapping) |prev| {
+                            best_mapping = SourceMapping{
+                                .generated_line = target_line,
+                                .generated_column = line_generated_column,
+                                .source_index = prev.source_index,
+                                .original_line = prev.original_line,
+                                .original_column = prev.original_column,
+                            };
+                        }
+                    }
+                    pos += 1;
+                    continue;
+                }
 
-            if (pos >= line_mappings.len) break;
+                // Decode source index delta (accumulates globally)
+                const src_idx_result = VLQ.decode(line_mappings, pos);
+                if (src_idx_result.start == pos) break;
+                global_source_index += src_idx_result.value;
+                pos = src_idx_result.start;
 
-            // Decode original column delta
-            const orig_col_result = VLQ.decode(line_mappings, pos);
-            if (orig_col_result.start == pos) break;
-            original_column += orig_col_result.value;
-            pos = orig_col_result.start;
+                if (pos >= line_mappings.len) break;
 
-            // Skip name index if present
-            if (pos < line_mappings.len and line_mappings[pos] != ',' and line_mappings[pos] != ';') {
-                const name_result = VLQ.decode(line_mappings, pos);
-                if (name_result.start > pos) {
-                    pos = name_result.start;
+                // Decode original line delta (accumulates globally)
+                const orig_line_result = VLQ.decode(line_mappings, pos);
+                if (orig_line_result.start == pos) break;
+                global_original_line += orig_line_result.value;
+                pos = orig_line_result.start;
+
+                if (pos >= line_mappings.len) break;
+
+                // Decode original column delta (accumulates globally)
+                const orig_col_result = VLQ.decode(line_mappings, pos);
+                if (orig_col_result.start == pos) break;
+                global_original_column += orig_col_result.value;
+                pos = orig_col_result.start;
+
+                // Skip name index if present
+                if (pos < line_mappings.len and line_mappings[pos] != ',' and line_mappings[pos] != ';') {
+                    const name_result = VLQ.decode(line_mappings, pos);
+                    if (name_result.start > pos) {
+                        pos = name_result.start;
+                    }
+                }
+
+                // Update best mapping if this is the target line and column is <= target
+                if (current_line == target_line and line_generated_column <= target_column) {
+                    // Only create mapping if accumulated values are non-negative
+                    // Negative values indicate corrupted/invalid sourcemap data
+                    if (global_original_line >= 0 and global_original_column >= 0) {
+                        best_mapping = SourceMapping{
+                            .generated_line = target_line,
+                            .generated_column = line_generated_column,
+                            .source_index = global_source_index,
+                            .original_line = global_original_line,
+                            .original_column = global_original_column,
+                        };
+                    }
                 }
             }
 
-            // Update best mapping if this column is <= target
-            if (generated_column <= target_column) {
-                best_mapping = SourceMapping{
-                    .generated_line = target_line,
-                    .generated_column = generated_column,
-                    .source_index = source_index,
-                    .original_line = original_line,
-                    .original_column = original_column,
-                };
-            }
+            current_line += 1;
         }
 
         return best_mapping;
